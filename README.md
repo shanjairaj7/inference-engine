@@ -13,3 +13,48 @@ The GPU blocks are allocated to be used in a reverse order. For example if the u
   - Also so that the most latest block of tokens are taken out and the initial token blocks are kept to allow for future requests to hit the tree of connections which will be preserved and there is a possible set of tokens that could be the generated tokens for incoming requests that hit cache of the first token blocks. For example if blocks are removed from the bottom, and a new request with the exact same tokens as `2` comes in, then the `[2,1,0]` can be used as possible next generation tokens that might be generated.
 The current code handles one request. Ideally this simulation should simulate async calls, background processes running as workers (each request) and process multiple requests, do continuous batching, make new requests wait until there are available GPU blocks, pre-fill tokens on available GPU blocks even if there is no space for decoding.
 I'll be updating this with these additions. Writing a actual inference engine that runs the latest open source models.
+
+## CPU engine (`engine/`)
+
+A real engine for Qwen2.5-0.5B on CPU, built on the ideas above:
+
+- `engine/block_manager.py`: paged KV cache with fixed-size blocks, ref counts, a chained-hash prefix cache (`hash(parent_hash, block_tokens)`), only full blocks get cached, and blocks are freed tail-first so shared prefixes survive the longest.
+- `engine/scheduler.py`: continuous batching. Each step decodes one token for every running sequence and fills the leftover token budget with chunked prefill. Requests wait when there aren't enough free blocks; under memory pressure the newest sequence is preempted (blocks released, recomputed later).
+- `engine/csrc/kernels.cpp`: the whole decoder stack runs in one native call per step ("megakernel" style): RMSNorm, RoPE + KV write, GQA paged attention over block tables, fused SiLU*up, and Fbgemm AVX2 int8 GEMMs with fused dequant/bias epilogues.
+- `engine/calibrate.py`: SmoothQuant. Activation maxima are collected once on WikiText-2 train and the scales are folded into RMSNorm / preceding weights, so int8 adds no runtime cost.
+- `engine/llm.py`: `LLMEngine` (sync) and `AsyncLLMEngine` (one background loop, a per-request `asyncio.Queue`).
+
+### Results (2 vCPU Xeon with AVX2, 7 GB RAM, no GPU)
+
+Throughput: 32 requests × 128 greedy tokens, chat-templated prompts (`bench/`):
+
+| Engine | tok/s |
+|---|---|
+| HF transformers fp32 (static batch 32) | 82.7 |
+| llama.cpp fp16 | 77.6 |
+| llama.cpp Q8_0 | 111.7 |
+| this engine fp32 | 98–111 |
+| this engine int8 (no SmoothQuant) | 244 |
+| **this engine int8 + SmoothQuant (default)** | **279** |
+
+Single request, 128 tokens: llama.cpp Q8_0 26.1 tok/s, this engine int8 48.0 tok/s.
+
+Quality: WikiText-2 test perplexity, ctx 512, first 20 chunks (`tests/ppl.py`, same protocol as `llama-perplexity`):
+
+| Model | PPL |
+|---|---|
+| this engine fp32 | 16.39 |
+| llama.cpp fp16 | 16.55 |
+| this engine int8 + SmoothQuant α=0.65 | 16.56 |
+| llama.cpp Q8_0 | 16.65 |
+| this engine int8, no SmoothQuant | 17.10 |
+
+fp32 greedy output matches HF transformers token-for-token (`tests/test_correctness.py`: 21/21 across default, chunked-prefill and preemption configs).
+
+### Run
+
+```bash
+pip install torch transformers safetensors ninja   # plus python3-dev; Fbgemm headers ship with torch
+IE_CALIB_FILE=wiki.train.raw python bench/engine_bench.py --quant int8   # calibration is cached in <model>/act_max.pt
+python tests/test_correctness.py
+```
