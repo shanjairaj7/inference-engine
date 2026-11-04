@@ -14,14 +14,15 @@ from .scheduler import SamplingParams, Scheduler, Sequence
 
 class LLMEngine:
     def __init__(self, model_path: str, num_blocks: int = 2048, block_size: int = 16,
-                 max_num_seqs: int = 64, max_batched_tokens: int = 512, threads: int | None = None):
+                 max_num_seqs: int = 64, max_batched_tokens: int = 512, threads: int | None = None,
+                 quant: str = "none"):
         if threads:
             torch.set_num_threads(threads)
         cfg = json.load(open(os.path.join(model_path, "config.json")))
         gen = json.load(open(os.path.join(model_path, "generation_config.json")))
         eos = gen.get("eos_token_id", cfg["eos_token_id"])
         self.eos_ids = set(eos if isinstance(eos, list) else [eos])
-        self.model = Qwen2(model_path, num_blocks, block_size)
+        self.model = Qwen2(model_path, num_blocks, block_size, quant=quant)
         self.blocks = BlockManager(num_blocks, block_size)
         self.scheduler = Scheduler(self.blocks, max_num_seqs, max_batched_tokens, eos_id=-1)
         self.scheduler.is_eos = lambda t: t in self.eos_ids
