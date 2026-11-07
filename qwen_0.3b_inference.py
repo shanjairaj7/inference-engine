@@ -1,5 +1,13 @@
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-device = torch.device(device)
+import torch, torch.nn as nn, torch.nn.functional as functional
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from dataclasses import dataclass, field
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.requests import Request as FastAPIRequest
+from uuid import uuid4
+
+device = torch.device('cpu')
 
 def apply_rope(query, key, cosine, sine):
     cosine, sine = cosine.unsqueeze(1), sine.unsqueeze(1)
@@ -9,7 +17,6 @@ def apply_rope(query, key, cosine, sine):
         return hidden_states * cosine + torch.cat((-second_half, first_half), dim=-1) * sine
 
     return rotate(query), rotate(key)
-
 
 class QwenModel(nn.Module):
     def __init__(self, loaded_model):
@@ -71,6 +78,9 @@ class QwenModel(nn.Module):
                 key = key.repeat_interleave(num_query_heads_per_kv_head, dim=1)
                 value = value.repeat_interleave(num_query_heads_per_kv_head, dim=1)
 
+            print(f"key: {key}")
+            print(f"key shape: {key.shape}")
+
             attention_output = functional.scaled_dot_product_attention(
                 query, key, value, attn_mask=causal_mask,
                 is_causal=start_position == 0 and num_new_tokens > 1,
@@ -86,57 +96,109 @@ class QwenModel(nn.Module):
         cache.num_cached_tokens = end_position
         return logits
 
+@dataclass
+class Request:
+    request_id: str
+    prompt: str
+    max_new_tokens: str # how many tokens to generate fully
+
+    block_ids: list[int] = field(default_factory=list)
+
+    num_computed_tokens: int = 0
+    num_cached_tokens: int = field(default=0)
+    num_new_tokens: int = 0
+
 class KVCache:
-    def __init__(self,cache_shape,num_blocks,input_ids,model_config,block_size=4):
+    def __init__(self,cache_shape,input_ids,model_config,request:Request,block_size=4):
         self.cache_shape = cache_shape
-        self.num_blocks = num_blocks
         self.block_size = block_size
         self.input_ids = input_ids
         self.model_config = model_config
+        self.current_request: Request = request
+        self.requests = {}
 
-        self.block_table = []
+        self.block_table = [i for i in range(int(model_config.max_position_embeddings / 4))]
+        self.free_blocks = self.block_table.copy()
 
         self.keys = torch.empty(self.cache_shape,device=device,dtype=torch.bfloat16)
         self.values = torch.empty_like(self.keys)
 
-        self.num_cached_tokens = 0
         self.max_cached_tokens = len(input_ids) + model_config.max_position_embeddings
+ 
+    @property
+    def num_cached_tokens(self):
+        print(f"self.requests: {self.requests}")
+        return self.requests[self.current_request.request_id].num_cached_tokens if len(self.requests.items()) > 0 else 0
 
-        @property
-        def max_cached_tokens():
-            print(f"cache cshape")
+    @num_cached_tokens.setter
+    def num_cached_tokens(self,value):
+        self.requests[self.current_request.request_id].num_cached_tokens = value
 
     def write_and_read(self,layer_index,key,value):
-        # logical_block = len(self.input_ids) // self.block_size
-        # physical_block = self.block_table[logical_block]
-        # slot = len(self.input_ids) % self.block_size
+        logical_block = key.shape[2] // self.block_size
+        physical_block = self.block_table[logical_block]
+        slot = key.shape[2] % self.block_size
 
-        start_position = self.num_cached_tokens
-        end_position = key.shape[2] if self.num_cached_tokens == 0 else (self.num_cached_tokens+key.shape[2])
+        # start_position = self.num_cached_tokens
+        # end_position = key.shape[2] if self.num_cached_tokens == 0 else (self.num_cached_tokens+key.shape[2])
 
-        # print(f"key shape: {key.shape}")
-        # print(f"self.keys shape: {self.keys.shape}")
+        print(f"key shape: {key.shape}")
+        print(f"self.keys shape: {self.keys.shape}")
+        print(f"self.input ids shape: {self.input_ids.shape}")
+        print(f"key: {key}")
+        num_tokens = key.shape[2]
 
-        self.keys[layer_index,:,:,start_position:end_position,:].copy_(key)
-        self.values[layer_index,:,:,start_position:end_position,:].copy_(value)
+        for token_i in range(key.shape[2]):
+            print(f"num cached tokens: {self.num_cached_tokens}. token i: {token_i}")
+            logical_block = (self.num_cached_tokens + token_i) // self.block_size
+            physical_block = self.block_table[logical_block]
+            slot = (self.num_cached_tokens + token_i) % self.block_size
+
+            self.keys[layer_index,:,:,physical_block,slot,:].copy_(key[:,:,token_i])
+            self.values[layer_index,:,:,physical_block,slot,:].copy_(value[:,:,token_i])
+            
+            contains_block = self.current_request.block_ids.__contains__(physical_block)
+            if not contains_block: self.current_request.block_ids.append(physical_block)
+            self.current_request.num_cached_tokens = self.num_cached_tokens
+            self.current_request.num_computed_tokens = self.input_ids.shape[1]
+            # self.current_request.num_cached_tokens += 1
+
+        # self.keys[layer_index,:,:,physical_block,slot,:].copy_(key)
+        # self.values[layer_index,:,:,physical_block,slot,:].copy_(value)
+
+        # self.num_cached_tokens = end_position : num_cached_tokens updated during forward pass
+
+
+        self.requests[self.current_request.request_id] = self.current_request
 
         # self.num_cached_tokens = key.shape[2]
 
-        return self.keys[layer_index,:,:,:end_position,:], self.values[layer_index,:,:,:end_position,:]
+        all_keys = [self.keys[layer_index,:,:,block_id,:] for block_id in self.current_request.block_ids]
+        all_values = [self.values[layer_index,:,:,block_id,:] for block_id in self.current_request.block_ids]
 
-def main():
+        return torch.cat(all_keys, dim=2), torch.cat(all_values, dim=2)
+
+    def get_requests(self):
+        return self.requests
+
+def main(request: Request):
     model_name = 'Qwen/Qwen3-0.6B'
-    max_new_tokens = 1046
-    num_blocks=20
+    block_size=4
+
+    print(request)
+
+    request_id = request.request_id
+    user_message = request.prompt
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     qwen_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     
     model = QwenModel(qwen_model)
     model_config = model.config
+    max_new_tokens = model_config.max_position_embeddings
 
     input_ids = tokenizer.apply_chat_template(
-        [{'role':'user','content':'what is kv cache'}],
+        [{'role':'user','content':user_message}],
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
@@ -145,25 +207,25 @@ def main():
 
     print(f"model config: {model_config}")
 
+    # [28, 1, 8, 1024, 4, 128]
     model_shape = (
         model_config.num_hidden_layers,
         1,
         model_config.num_key_value_heads,
-        model_config.max_position_embeddings,
+        int(model_config.max_position_embeddings / block_size),
+        block_size,
         model_config.head_dim
     )
 
     eos_token_id = qwen_model.generation_config.eos_token_id
 
-    cache = KVCache(model_shape,num_blocks,input_ids,model_config)
+    cache = KVCache(model_shape,input_ids,model_config,request,block_size)
     generation_output = []
-
-    generation_start_time = datetime.now()
 
     for i in range(max_new_tokens):
         result = model(input_ids,cache)
         next_token_id = result[:,-1].argmax().item()
-        # print(f"result: {result}")
+        print(f"result: {result}")
 
         if next_token_id in eos_token_id:
             break
@@ -171,16 +233,33 @@ def main():
         input_ids = torch.tensor([[next_token_id]],device=device)
         generation_output.append(next_token_id)
 
-        decoded_token = tokenizer.decode([next_token_id],skip_special_tensors=True)
-        print(decoded_token, end="", flush=True)
+    response = tokenizer.decode(generation_output,skip_special_tensors=True)
+    print(f"response: {response}")
+
+# main()
+
+app = FastAPI()
 
 
-    generation_end_time = datetime.now()
-    generation_seconds = generation_end_time - generation_start_time
-    tokens_per_second = len(generation_output) / generation_seconds.total_seconds()
-    print(f"generation seconds: {generation_seconds}")
-    print(f"tokens per second: {tokens_per_second:.3f} tokens/s")
-    # response = tokenizer.decode(generation_output,skip_special_tensors=True)
-    # print(f"response: {response}")
 
-main()
+@app.post('/')
+def home(message: dict):
+    print(f"message is here")
+    print(message)
+
+    #     prompt: str
+    # max_new_tokens: str # how many tokens to generate fully
+
+    # block_ids: list[int] = []
+
+    # num_computed_tokens: int = 0
+    # num_cached_tokens: int = 0
+    # num_new_tokens: int = 0
+
+    request = Request(
+        request_id=str(uuid4()), 
+        prompt=message['prompt']['text'], 
+        max_new_tokens=message['prompt']['new_tokens'])
+    main(request)
+
+    return {'message': message}
