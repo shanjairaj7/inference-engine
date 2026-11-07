@@ -13,3 +13,7 @@ The GPU blocks are allocated to be used in a reverse order. For example if the u
   - Also so that the most latest block of tokens are taken out and the initial token blocks are kept to allow for future requests to hit the tree of connections which will be preserved and there is a possible set of tokens that could be the generated tokens for incoming requests that hit cache of the first token blocks. For example if blocks are removed from the bottom, and a new request with the exact same tokens as `2` comes in, then the `[2,1,0]` can be used as possible next generation tokens that might be generated.
 The current code handles one request. Ideally this simulation should simulate async calls, background processes running as workers (each request) and process multiple requests, do continuous batching, make new requests wait until there are available GPU blocks, pre-fill tokens on available GPU blocks even if there is no space for decoding.
 I'll be updating this with these additions. Writing a actual inference engine that runs the latest open source models.
+
+`qwen_0.3b_inference.py`
+
+This is the inference engine with running attention on the Qwen-0.3b weights, storing the kv results over 28 layers, 8 kv heads and the multiple blocks of KV Cache. 33 tokens per second on Macbook M4 Air 16GB unified memory. 
