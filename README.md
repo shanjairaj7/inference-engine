@@ -16,4 +16,4 @@ I'll be updating this with these additions. Writing a actual inference engine th
 
 `qwen_0.3b_inference.py`
 
-This is the inference engine with running attention on the Qwen-0.3b weights, storing the kv results over 28 layers, 8 kv heads and the multiple blocks of KV Cache. 33 tokens per second on Macbook M4 Air 16GB unified memory. 
+This is the inference engine with running attention on the Qwen-0.3b weights, storing the kv results over 28 layers, 8 kv heads and the multiple blocks of KV Cache. 33 tokens per second on Macbook M4 Air 16GB unified memory. Inference has block caching running over 28 layers, 1 sequence, 8 kv heads, 10240 blocks, 4 tokens per block, 128 head dim. 32.58 tokens/s with block caching on MacBook Air M4 16GB unified memory.
