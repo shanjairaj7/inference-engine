@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.requests import Request as FastAPIRequest
 from uuid import uuid4
+from datetime import datetime
 
 device = torch.device('cpu')
 
@@ -78,8 +79,8 @@ class QwenModel(nn.Module):
                 key = key.repeat_interleave(num_query_heads_per_kv_head, dim=1)
                 value = value.repeat_interleave(num_query_heads_per_kv_head, dim=1)
 
-            print(f"key: {key}")
-            print(f"key shape: {key.shape}")
+            # print(f"key: {key}")
+            # print(f"key shape: {key.shape}")
 
             attention_output = functional.scaled_dot_product_attention(
                 query, key, value, attn_mask=causal_mask,
@@ -127,7 +128,7 @@ class KVCache:
  
     @property
     def num_cached_tokens(self):
-        print(f"self.requests: {self.requests}")
+        # print(f"self.requests: {self.requests}")
         return self.requests[self.current_request.request_id].num_cached_tokens if len(self.requests.items()) > 0 else 0
 
     @num_cached_tokens.setter
@@ -142,14 +143,14 @@ class KVCache:
         # start_position = self.num_cached_tokens
         # end_position = key.shape[2] if self.num_cached_tokens == 0 else (self.num_cached_tokens+key.shape[2])
 
-        print(f"key shape: {key.shape}")
-        print(f"self.keys shape: {self.keys.shape}")
-        print(f"self.input ids shape: {self.input_ids.shape}")
-        print(f"key: {key}")
+        # print(f"key shape: {key.shape}")
+        # print(f"self.keys shape: {self.keys.shape}")
+        # print(f"self.input ids shape: {self.input_ids.shape}")
+        # print(f"key: {key}")
         num_tokens = key.shape[2]
 
         for token_i in range(key.shape[2]):
-            print(f"num cached tokens: {self.num_cached_tokens}. token i: {token_i}")
+            # print(f"num cached tokens: {self.num_cached_tokens}. token i: {token_i}")
             logical_block = (self.num_cached_tokens + token_i) // self.block_size
             physical_block = self.block_table[logical_block]
             slot = (self.num_cached_tokens + token_i) % self.block_size
@@ -185,7 +186,7 @@ def main(request: Request):
     model_name = 'Qwen/Qwen3-0.6B'
     block_size=4
 
-    print(request)
+    # print(request)
 
     request_id = request.request_id
     user_message = request.prompt
@@ -205,7 +206,7 @@ def main(request: Request):
         tokenize=True
     )['input_ids'].to(device)
 
-    print(f"model config: {model_config}")
+    # print(f"model config: {model_config}")
 
     # [28, 1, 8, 1024, 4, 128]
     model_shape = (
@@ -222,10 +223,12 @@ def main(request: Request):
     cache = KVCache(model_shape,input_ids,model_config,request,block_size)
     generation_output = []
 
+    generation_start_time = datetime.now()
+
     for i in range(max_new_tokens):
         result = model(input_ids,cache)
         next_token_id = result[:,-1].argmax().item()
-        print(f"result: {result}")
+        # print(f"result: {result}")
 
         if next_token_id in eos_token_id:
             break
@@ -233,8 +236,16 @@ def main(request: Request):
         input_ids = torch.tensor([[next_token_id]],device=device)
         generation_output.append(next_token_id)
 
+        decoded_token = tokenizer.decode([next_token_id], skip_special_tensors=True)
+        print(decoded_token, end="", flush=True)
+
+    generation_end_time = datetime.now()
+    generation_time = generation_end_time - generation_start_time
+    tokens_per_second = (len(generation_output) / generation_time.total_seconds())
+    print(f"tokens per second: {tokens_per_second:.2f} tokens/s")
+
     response = tokenizer.decode(generation_output,skip_special_tensors=True)
-    print(f"response: {response}")
+    # print(f"response: {response}")
 
 # main()
 
